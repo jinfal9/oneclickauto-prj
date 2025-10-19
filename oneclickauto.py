@@ -11,73 +11,181 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-
 # =========================
-# 🔧 [필수 설정] 여러분 사이트에 맞게 바꾸세요
+# 사이트/선택자 설정
 # =========================
-TARGET_URL = "https://deadline-notify.netlify.app/"   # 자동 입력할 대상 URL
+TARGET_URL = "https://deadline-notify.netlify.app/"
 
-# 아래 3개는 '어떻게 요소를 찾을지'를 정합니다.
-# 방법: By.ID / By.NAME / By.CSS_SELECTOR / By.XPATH 중 택1
-NUMBER_FIELD = (By.NAME, "phone")          # 예: (By.ID, "userNumber"), (By.NAME, "phone"), (By.CSS_SELECTOR, "input[name='phone']")
-NAME_FIELD   = (By.NAME, "username")       # 예: (By.ID, "userName"), (By.XPATH, "//input[@placeholder='이름']")
-SUBMIT_BTN   = (By.CSS_SELECTOR, "button[type='submit']")  # 없으면 None 로 두세요 (자동 클릭 스킵)
+# 보내주신 DOM과 1:1 매핑 (필수 4개 + 선택 1개)
+TITLE_LOCATORS    = [(By.ID, "title")]
+SOURCE_LOCATORS   = [(By.ID, "source")]
+CATEGORY_LOCATORS = [(By.ID, "category")]
+DUE_LOCATORS      = [(By.ID, "due"), (By.CSS_SELECTOR, "input[type='date']")]  # type=date
+LINK_LOCATORS     = [(By.ID, "link")]
+SUBMIT_LOCATORS   = [(By.ID, "btnAdd"), (By.XPATH, "//button[normalize-space()='추가']")]
 
-# 대기(타임아웃) 기본값
 DEFAULT_WAIT_SECONDS = 15
 
-# 크롬 옵션 (원하면 프로필 사용/헤드리스 등 추가 가능)
 def build_chrome_options():
-    options = webdriver.ChromeOptions()
-    # options.add_argument("--headless=new")   # 창 숨김 모드 (원하면 주석 해제)
-    options.add_argument("--start-maximized")
-    # options.add_argument("--user-data-dir=C:/ChromeProfile")  # 로그인 유지가 필요할 경우 프로필 경로 사용
-    return options
+    opts = webdriver.ChromeOptions()
+    # opts.add_argument("--headless=new")  # 확인이 필요 없으면 사용
+    opts.add_argument("--start-maximized")
+    return opts
+
+def create_chrome_driver():
+    """Selenium 4/3 겸용"""
+    options = build_chrome_options()
+    try:
+        return webdriver.Chrome(service=Service(ChromeDriverManager().install()),
+                                options=options)
+    except TypeError:  # Selenium 3.x
+        return webdriver.Chrome(ChromeDriverManager().install(), options=options)
+
+# ---------- 공통 유틸 ----------
+def wait_visible_any(driver, locator_list, wait_sec=DEFAULT_WAIT_SECONDS):
+    last_err = None
+    for by, value in locator_list:
+        try:
+            el = WebDriverWait(driver, wait_sec).until(
+                EC.visibility_of_element_located((by, value))
+            )
+            return el
+        except Exception as e:
+            last_err = e
+    raise last_err or TimeoutError("요소를 찾지 못했습니다.")
+
+def safe_send_text(driver, element, text):
+    """send_keys 실패 대비: JS로 값 주입 + input/change 이벤트"""
+    t = "" if text is None else str(text)
+    try:
+        element.clear()
+    except Exception:
+        pass
+    try:
+        element.send_keys(t)
+        return
+    except Exception:
+        pass
+    js = """
+    const el = arguments[0];
+    const val = arguments[1];
+    el.value = val;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    """
+    driver.execute_script(js, element, t)
+
+def fill_date(driver, element, text):
+    """
+    type=date 필드에 날짜를 안전하게 주입.
+    - 허용 입력 예: "2025-05-22", "2025/05/22", "20250522"
+    - 내부적으로 (Y, M, D)를 뽑아 new Date(Y, M-1, D)로 valueAsDate 지정
+    - React 등 프레임워크 반영 위해 input/change/blur 이벤트까지 디스패치
+    """
+    raw = (text or "").strip()
+
+    # 1) 숫자만 남기기 (하이픈/슬래시 등 제거)
+    digits = "".join(ch for ch in raw if ch.isdigit())
+
+    # 2) 자리수 보정: YYYYMMDD 형태로 맞추기
+    if len(digits) >= 8:
+        y = int(digits[0:4])
+        m = int(digits[4:6])
+        d = int(digits[6:8])
+    else:
+        # 최소한 YYYY-MM-DD 형태에서 앞 10자만 처리
+        try:
+            y = int(raw[0:4]); m = int(raw[5:7]); d = int(raw[8:10])
+        except Exception:
+            # 마지막 안전장치: 그냥 텍스트로 시도
+            safe_send_text(driver, element, raw[:10])
+            return
+
+    # 3) 브라우저 로캘/타임존 영향을 피하려고 (Y, M-1, D)로 Date 생성
+    js = r"""
+    const el = arguments[0];
+    const y  = arguments[1];
+    const m  = arguments[2];  // 1~12
+    const d  = arguments[3];
+    // valueAsDate는 로컬 타임존 기준 Date 객체를 기대함
+    el.valueAsDate = new Date(y, m - 1, d);
+
+    // 혹시 프레임워크가 문자열 value를 감시한다면 동기화
+    const mm = String(m).padStart(2,'0');
+    const dd = String(d).padStart(2,'0');
+    el.value = `${y}-${mm}-${dd}`;
+
+    // 상태 업데이트 이벤트
+    el.dispatchEvent(new Event('input',  { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur',   { bubbles: true }));
+    """
+    driver.execute_script(js, element, y, m, d)
+
 # =========================
-
-
+# GUI 앱
+# =========================
 class AutoInputApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("웹 자동 입력 매크로 (Chrome + Selenium)")
-        self.geometry("520x360")
+        self.title("데드라인 5필드 자동 입력 (Chrome + Selenium)")
+        self.geometry("680x520")
         self.resizable(False, False)
 
-        # 입력 폼
-        frm = ttk.LabelFrame(self, text="입력 정보")
+        frm = ttk.LabelFrame(self, text="입력 정보 (제목/출처/카테고리/마감일/링크)")
         frm.pack(fill="x", padx=12, pady=10)
 
-        ttk.Label(frm, text="번호:").grid(row=0, column=0, sticky="e", padx=8, pady=8)
-        self.entry_number = ttk.Entry(frm)
-        self.entry_number.grid(row=0, column=1, sticky="we", padx=8, pady=8)
+        # 1) 제목
+        ttk.Label(frm, text="제목:").grid(row=0, column=0, sticky="e", padx=8, pady=6)
+        self.ent_title = ttk.Entry(frm)
+        self.ent_title.grid(row=0, column=1, sticky="we", padx=8, pady=6)
 
-        ttk.Label(frm, text="이름:").grid(row=1, column=0, sticky="e", padx=8, pady=8)
-        self.entry_name = ttk.Entry(frm)
-        self.entry_name.grid(row=1, column=1, sticky="we", padx=8, pady=8)
+        # 2) 출처
+        ttk.Label(frm, text="출처:").grid(row=1, column=0, sticky="e", padx=8, pady=6)
+        self.ent_source = ttk.Entry(frm)
+        self.ent_source.grid(row=1, column=1, sticky="we", padx=8, pady=6)
+
+        # 3) 카테고리
+        ttk.Label(frm, text="카테고리:").grid(row=2, column=0, sticky="e", padx=8, pady=6)
+        self.ent_category = ttk.Entry(frm)
+        self.ent_category.grid(row=2, column=1, sticky="we", padx=8, pady=6)
+
+        # 4) 마감일 (input[type=date])
+        ttk.Label(frm, text="마감일 (YYYY-MM-DD):").grid(row=3, column=0, sticky="e", padx=8, pady=6)
+        self.ent_due = ttk.Entry(frm)
+        self.ent_due.grid(row=3, column=1, sticky="we", padx=8, pady=6)
+
+        # 5) 링크 (선택)
+        ttk.Label(frm, text="링크(선택):").grid(row=4, column=0, sticky="e", padx=8, pady=6)
+        self.ent_link = ttk.Entry(frm)
+        self.ent_link.grid(row=4, column=1, sticky="we", padx=8, pady=6)
 
         frm.grid_columnconfigure(1, weight=1)
 
-        # 실행/중지 버튼
+        # 옵션
+        opt = ttk.LabelFrame(self, text="옵션")
+        opt.pack(fill="x", padx=12, pady=(0,10))
+        self.keep_open_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="완료 후 브라우저 유지", variable=self.keep_open_var).pack(anchor="w", padx=8, pady=6)
+
+        # 버튼
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=(0,10))
-
         self.btn_start = ttk.Button(btns, text="시작", command=self.on_start)
         self.btn_start.pack(side="left", padx=(0,6))
-
         self.btn_stop = ttk.Button(btns, text="중지(창 닫기)", command=self.on_stop, state="disabled")
         self.btn_stop.pack(side="left")
 
-        # 상태 로그
+        # 로그
         logfrm = ttk.LabelFrame(self, text="진행 상태")
         logfrm.pack(fill="both", expand=True, padx=12, pady=(0,12))
-
         self.txt_log = tk.Text(logfrm, height=12, wrap="word")
         self.txt_log.pack(fill="both", expand=True, padx=8, pady=8)
         self.txt_log.configure(state="disabled")
 
         self.driver = None
         self.worker = None
-        self.stop_flag = False
+        self.running = False
 
     def log(self, msg: str):
         self.txt_log.configure(state="normal")
@@ -87,28 +195,37 @@ class AutoInputApp(tk.Tk):
         self.update_idletasks()
 
     def set_running(self, running: bool):
+        self.running = running
         self.btn_start.configure(state=("disabled" if running else "normal"))
-        self.btn_stop.configure(state=("normal" if running else "disabled"))
+        self.btn_stop.configure(state=("normal" if (running or self.driver) else "disabled"))
 
     def on_start(self):
-        number = self.entry_number.get().strip()
-        name = self.entry_name.get().strip()
-
-        if not number or not name:
-            messagebox.showwarning("입력 확인", "번호와 이름을 모두 입력하세요.")
+        if self.running:
+            self.log("이미 실행 중입니다.")
             return
 
-        self.stop_flag = False
-        self.set_running(True)
-        self.log("작업 시작… 크롬을 준비합니다.")
+        title    = self.ent_title.get().strip()
+        source   = self.ent_source.get().strip()
+        category = self.ent_category.get().strip()
+        due      = self.ent_due.get().strip()
+        link     = self.ent_link.get().strip()
 
-        # 백그라운드 스레드에서 셀레니움 작업 수행 (GUI 멈춤 방지)
-        self.worker = threading.Thread(target=self.run_selenium_flow, args=(number, name), daemon=True)
+        # 필수값 검증 (링크는 선택)
+        if not (title and source and category and due):
+            messagebox.showwarning("입력 확인", "제목/출처/카테고리/마감일을 모두 입력하세요. (링크는 선택)")
+            return
+
+        self.set_running(True)
+        self.log("크롬을 준비합니다…")
+        self.worker = threading.Thread(
+            target=self.run_flow,
+            args=(title, source, category, due, link),
+            daemon=True
+        )
         self.worker.start()
 
     def on_stop(self):
-        self.stop_flag = True
-        self.log("중지 신호 전송됨. 브라우저를 닫습니다…")
+        self.log("브라우저 종료를 시도합니다…")
         try:
             if self.driver:
                 self.driver.quit()
@@ -118,84 +235,71 @@ class AutoInputApp(tk.Tk):
             pass
         self.set_running(False)
 
-    def wait_and_find(self, locator, wait_sec=DEFAULT_WAIT_SECONDS):
-        by, value = locator
-        wait = WebDriverWait(self.driver, wait_sec)
-        return wait.until(EC.presence_of_element_located((by, value)))
-
-    def wait_and_clickable(self, locator, wait_sec=DEFAULT_WAIT_SECONDS):
-        by, value = locator
-        wait = WebDriverWait(self.driver, wait_sec)
-        return wait.until(EC.element_to_be_clickable((by, value)))
-
-    def safe_send_keys(self, element, text):
+    # ---------- Selenium 수행 ----------
+    def run_flow(self, title, source, category, due, link):
         try:
-            element.clear()
-        except Exception:
-            pass
-        try:
-            element.send_keys(text)
-        except Exception:
-            # 최후의 수단: JS로 값 주입
-            self.driver.execute_script("arguments[0].value = arguments[1];", element, text)
-
-    def run_selenium_flow(self, number: str, name: str):
-        try:
-            # 1) 드라이버 실행
-            options = build_chrome_options()
-            self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()),
-                                           options=options)
-
+            self.driver = create_chrome_driver()
             self.log(f"페이지 이동: {TARGET_URL}")
             self.driver.get(TARGET_URL)
 
-            # 2) 요소 대기 및 입력
-            self.log("번호 입력칸 찾는 중…")
-            number_el = self.wait_and_find(NUMBER_FIELD)
-            self.safe_send_keys(number_el, number)
-            self.log(f"번호 입력 완료: {number}")
+            # 제목
+            self.log("제목(#title) 입력 중…")
+            el = wait_visible_any(self.driver, TITLE_LOCATORS)
+            safe_send_text(self.driver, el, title)
 
-            self.log("이름 입력칸 찾는 중…")
-            name_el = self.wait_and_find(NAME_FIELD)
-            self.safe_send_keys(name_el, name)
-            self.log(f"이름 입력 완료: {name}")
+            # 출처
+            self.log("출처(#source) 입력 중…")
+            el = wait_visible_any(self.driver, SOURCE_LOCATORS)
+            safe_send_text(self.driver, el, source)
 
-            # 3) 제출(선택)
-            if SUBMIT_BTN is not None:
-                self.log("제출 버튼 찾는 중…")
-                try:
-                    submit_el = self.wait_and_clickable(SUBMIT_BTN)
-                except Exception:
-                    # 클릭 불가 시 presence로라도 찾아서 JS 클릭 시도
-                    submit_el = self.wait_and_find(SUBMIT_BTN)
-                try:
-                    submit_el.click()
-                except Exception:
-                    self.driver.execute_script("arguments[0].click();", submit_el)
-                self.log("제출 버튼 클릭 완료.")
+            # 카테고리
+            self.log("카테고리(#category) 입력 중…")
+            el = wait_visible_any(self.driver, CATEGORY_LOCATORS)
+            safe_send_text(self.driver, el, category)
+
+            # 마감일(type=date)
+            self.log("마감일(#due) 입력 중…")
+            el = wait_visible_any(self.driver, DUE_LOCATORS)
+            fill_date(self.driver, el, due)
+
+            # 링크(선택)
+            if link:
+                self.log("링크(#link) 입력 중…")
+                el = wait_visible_any(self.driver, LINK_LOCATORS)
+                safe_send_text(self.driver, el, link)
             else:
-                self.log("제출 버튼 설정이 None이라 클릭을 건너뜁니다.")
+                self.log("링크는 비워둠(선택).")
 
-            # 4) 결과 확인을 위해 잠시 대기
-            time.sleep(3)
-            self.log("완료되었습니다. 브라우저를 직접 확인하세요.")
+            # [추가] 버튼
+            self.log("추가 버튼 클릭 중…")
+            btn = wait_visible_any(self.driver, SUBMIT_LOCATORS)
+            try:
+                btn.click()
+            except Exception:
+                self.driver.execute_script("arguments[0].click();", btn)
+
+            time.sleep(1.2)
+            self.log("모든 입력을 마쳤습니다.")
 
         except Exception as e:
             self.log("⚠ 오류 발생:\n" + "".join(traceback.format_exception_only(type(e), e)).strip())
-            self.log("자세한 스택 트레이스는 콘솔에서 확인하거나 코드 상단 설정을 점검하세요.")
         finally:
-            # 자동 종료를 원치 않으면 주석 처리
-            try:
-                if self.driver:
-                    self.log("브라우저를 닫습니다…")
-                    self.driver.quit()
-                    self.driver = None
-                    self.log("크롬 종료 완료.")
-            except Exception:
-                pass
+            if self.keep_open_var.get():
+                self.log("설정에 따라 브라우저를 유지합니다. 필요 시 [중지(창 닫기)] 버튼을 누르세요.")
+            else:
+                try:
+                    if self.driver:
+                        self.log("설정에 따라 브라우저를 닫습니다…")
+                        self.driver.quit()
+                        self.driver = None
+                        self.log("크롬 종료 완료.")
+                except Exception:
+                    pass
             self.set_running(False)
 
-
+# =========================
+# 진입점
+# =========================
 if __name__ == "__main__":
     app = AutoInputApp()
     app.mainloop()
